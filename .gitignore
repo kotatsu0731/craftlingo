@@ -1,5 +1,11 @@
 node_modules/
 dist/
+.wrangler/
+.dev.vars*
+worker-configuration.d.ts
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
 .DS_Store
 *.local
 npm-debug.log*

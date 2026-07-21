@@ -12,10 +12,20 @@ npm run dev
 品質チェックは次のコマンドで実行できます。
 
 ```bash
-npm run typecheck
-npm test
-npm run build
+npm run check
 ```
+
+## Cloudflare Workers
+
+Cloudflare Vite pluginでクライアントをビルドし、静的アセットをWorkersで配信できます。初回だけCloudflareへログインしてください。
+
+```bash
+npx wrangler login
+npm run check
+npm run deploy
+```
+
+`npm run deploy` はViteの本番ビルド後に `wrangler deploy` を実行します。デプロイ前のWorkersランタイム確認には `npm run preview` を使えます。Workerは静的アセットを `ASSETS.fetch` で返し、SPAのフォールバックとWllamaに必要なCOOP/COEPヘッダーを設定します。
 
 ## 対応している入力
 
