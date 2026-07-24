@@ -32,10 +32,19 @@ const wllamaMock = vi.hoisted(() => {
     }
   }
 
-  return { MockWllama };
+  class MockCacheManager {
+    static instances: MockCacheManager[] = [];
+
+    constructor(readonly backends: unknown[]) {
+      MockCacheManager.instances.push(this);
+    }
+  }
+
+  return { MockCacheManager, MockWllama };
 });
 
 vi.mock("@wllama/wllama/esm/index.js", () => ({
+  CacheManager: wllamaMock.MockCacheManager,
   LogLevel: { ERROR: 4 },
   Wllama: wllamaMock.MockWllama,
 }));
@@ -68,6 +77,7 @@ function currentLogger(): { warn: (...values: unknown[]) => void } {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  wllamaMock.MockCacheManager.instances.length = 0;
   wllamaMock.MockWllama.instances.length = 0;
 });
 
@@ -91,6 +101,10 @@ describe("LFM model configuration", () => {
     expect(runtime.pathConfig).toEqual({
       default: expect.stringContaining("wllama.wasm"),
     });
+    expect(runtime.config).toEqual(expect.objectContaining({
+      cacheManager: expect.any(wllamaMock.MockCacheManager),
+    }));
+    expect(wllamaMock.MockCacheManager.instances[0]?.backends).toHaveLength(1);
     expect(runtime.loadModelFromUrl).toHaveBeenCalledOnce();
     expect(runtime.loadModelFromUrl).toHaveBeenCalledWith(LFM_MODEL.url, expect.objectContaining({
       useCache: true,
