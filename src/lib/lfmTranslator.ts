@@ -84,6 +84,95 @@ const WLLAMA_BASE_LOAD_OPTIONS = {
   jinja: true,
 } satisfies Omit<WllamaLoadOptions, "log_level">;
 
+const WLLAMA_CACHE_DIRECTORY = "cache";
+const WLLAMA_METADATA_PREFIX = "__metadata__";
+
+interface StorageHint {
+  sha256: string;
+}
+
+/**
+ * Keeps Wllama's cache in OPFS and rejects interrupted downloads before
+ * Wllama mistakes them for complete content-addressed files.
+ */
+class ValidatedOpfsStorageBackend {
+  isSupported(): boolean {
+    return typeof navigator !== "undefined"
+      && typeof navigator.storage?.getDirectory === "function";
+  }
+
+  private async getDirectory(): Promise<FileSystemDirectoryHandle> {
+    const root = await navigator.storage.getDirectory();
+    return root.getDirectoryHandle(WLLAMA_CACHE_DIRECTORY, { create: true });
+  }
+
+  async read(key: string): Promise<Blob | null> {
+    try {
+      const directory = await this.getDirectory();
+      const handle = await directory.getFileHandle(key);
+      return handle.getFile();
+    } catch {
+      return null;
+    }
+  }
+
+  async write(key: string, stream: ReadableStream): Promise<void> {
+    const directory = await this.getDirectory();
+    const handle = await directory.getFileHandle(key, { create: true });
+    const writable = await handle.createWritable();
+    try {
+      await stream.pipeTo(writable);
+    } catch (error) {
+      await writable.abort(error).catch(() => undefined);
+      await directory.removeEntry(key).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  async getSize(key: string, hint?: StorageHint): Promise<number> {
+    const file = await this.read(key);
+    if (!file) return -1;
+    if (!hint) return file.size;
+
+    const metadataFile = await this.read(`${WLLAMA_METADATA_PREFIX}${key}`);
+    if (!metadataFile) return -1;
+    try {
+      const metadata = JSON.parse(await metadataFile.text()) as {
+        originalSize?: number;
+        sha256?: string;
+      };
+      if (metadata.originalSize !== file.size) return -1;
+      if (metadata.sha256 && metadata.sha256 !== hint.sha256) return -1;
+      return file.size;
+    } catch {
+      return -1;
+    }
+  }
+
+  async list(): Promise<Array<{ key: string; size: number }>> {
+    const directory = await this.getDirectory();
+    const entries = (directory as FileSystemDirectoryHandle & {
+      entries(): AsyncIterableIterator<[string, FileSystemHandle]>;
+    }).entries();
+    const result: Array<{ key: string; size: number }> = [];
+    for await (const [key, handle] of entries) {
+      if (handle.kind !== "file") continue;
+      const file = await (handle as FileSystemFileHandle).getFile();
+      result.push({ key, size: file.size });
+    }
+    return result;
+  }
+
+  async delete(key: string): Promise<void> {
+    try {
+      const directory = await this.getDirectory();
+      await directory.removeEntry(key);
+    } catch (error) {
+      if (!(error instanceof DOMException) || error.name !== "NotFoundError") throw error;
+    }
+  }
+}
+
 const DESKTOP_PROFILE = {
   loadOptions: { n_ctx: 8192 },
   maxTokens: 4096,
@@ -226,9 +315,10 @@ export class LfmTranslator {
     if (this.runtime?.isModelLoaded() && this.loadedModel === model) return;
     await this.disposeRuntime();
 
-    const { LogLevel, Wllama } = await import("@wllama/wllama/esm/index.js");
+    const { CacheManager, LogLevel, Wllama } = await import("@wllama/wllama/esm/index.js");
     const profile = getRuntimeProfile();
     const runtime = new Wllama({ default: wllamaWasmUrl }, {
+      cacheManager: new CacheManager([new ValidatedOpfsStorageBackend()]),
       logger: this.createLogger(),
     });
     try {
