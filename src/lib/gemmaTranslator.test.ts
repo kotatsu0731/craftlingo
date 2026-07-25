@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   GEMMA_MODELS,
+  GemmaTranslator,
   formatDebugArguments,
   formatDebugValue,
   getModelSource,
@@ -158,6 +159,127 @@ describe("parseTranslationMessage", () => {
         { id: 1, text: "Better草モード" },
       ],
     });
+  });
+});
+
+describe("GemmaTranslator.translate", () => {
+  it("protects formatting codes, omits raw keys, and retries missing long entries separately", async () => {
+    const pendingResponses = [
+      [
+        { id: 1, text: "CPU負荷" },
+        { id: 2, text: "一部の設定は既定値に置き換えられます。現在の設定は一部上書きされる場合があります。" },
+      ],
+      [{
+        id: 0,
+        text: "Distant Horizons の描画品質をまとめて変更します。GPU使用率やフレームレートに応じて下げてください。",
+      }],
+      [{
+        id: 0,
+        text: "__CRAFTLINGO_FORMAT_0__一部の設定は既定値に置き換えられます。__CRAFTLINGO_FORMAT_1__現在の設定は一部上書きされる場合があります。__CRAFTLINGO_FORMAT_2__",
+      }],
+    ];
+    const sentMessages: string[] = [];
+    const deletedConversations: ReturnType<typeof vi.fn>[] = [];
+    const engine = {
+      createConversation: vi.fn().mockImplementation(async () => {
+        const translations = pendingResponses.shift();
+        const deleteConversation = vi.fn().mockResolvedValue(undefined);
+        deletedConversations.push(deleteConversation);
+        return {
+          cancel: vi.fn(),
+          delete: deleteConversation,
+          sendMessage: vi.fn().mockImplementation(async (message: string) => {
+            sentMessages.push(message);
+            return {
+              role: "assistant",
+              tool_calls: [{
+                type: "function",
+                function: {
+                  name: "submit_translations",
+                  arguments: { translations },
+                },
+              }],
+            };
+          }),
+        };
+      }),
+    };
+    const translator = new GemmaTranslator();
+    const diagnostics = vi.fn();
+    translator.setDiagnosticListener(diagnostics);
+    (translator as unknown as { engine: typeof engine }).engine = engine;
+
+    await expect(translator.translate([
+      {
+        key: "distanthorizons.config.client.qualityPresetSetting.@tooltip",
+        source: "Modifies a number of graphical settings to quickly change Distant Horizons' rendering quality. Lower this setting if your GPU is at max usage or you are having framerate issues.",
+      },
+      { key: "distanthorizons.config.client.threadPresetSetting", source: "CPU Load" },
+      {
+        key: "config.manager.warning.lose_some_config",
+        source: "§eSome of your settings will be replaced with the modpack's defaults. §lYour current configs may be partially overwritten.§r",
+      },
+    ])).resolves.toEqual({
+      translations: {
+        "distanthorizons.config.client.qualityPresetSetting.@tooltip":
+          "Distant Horizons の描画品質をまとめて変更します。GPU使用率やフレームレートに応じて下げてください。",
+        "distanthorizons.config.client.threadPresetSetting": "CPU負荷",
+        "config.manager.warning.lose_some_config":
+          "§e一部の設定は既定値に置き換えられます。§l現在の設定は一部上書きされる場合があります。§r",
+      },
+      rejected: [],
+    });
+
+    expect(engine.createConversation).toHaveBeenCalledTimes(3);
+    for (const message of sentMessages) {
+      expect(message).not.toContain("\"key\"");
+      expect(message).not.toContain("@tooltip");
+    }
+    expect(sentMessages[0]).not.toContain("§e");
+    expect(sentMessages[0]).toContain("__CRAFTLINGO_FORMAT_0__");
+    expect(diagnostics).toHaveBeenCalledWith(expect.objectContaining({
+      level: "warning",
+      message: expect.stringContaining("2件"),
+    }));
+    expect(deletedConversations).toHaveLength(3);
+    for (const deleted of deletedConversations) expect(deleted).toHaveBeenCalledOnce();
+  });
+
+  it("cancels an in-flight conversation and preserves the abort reason", async () => {
+    const controller = new AbortController();
+    const reason = new DOMException("翻訳を一時停止しました。", "AbortError");
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let rejectGeneration!: (error: unknown) => void;
+    const cancel = vi.fn(() => rejectGeneration(new Error("LiteRT generation cancelled")));
+    const deleteConversation = vi.fn().mockResolvedValue(undefined);
+    const conversation = {
+      cancel,
+      delete: deleteConversation,
+      sendMessage: vi.fn(() => new Promise<never>((_resolve, reject) => {
+        rejectGeneration = reject;
+        markStarted();
+      })),
+    };
+    const engine = {
+      createConversation: vi.fn().mockResolvedValue(conversation),
+    };
+    const translator = new GemmaTranslator();
+    (translator as unknown as { engine: typeof engine }).engine = engine;
+
+    const translating = translator.translate(
+      [{ key: "item.test", source: "Test" }],
+      {},
+      controller.signal,
+    );
+    await started;
+    controller.abort(reason);
+
+    await expect(translating).rejects.toBe(reason);
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(deleteConversation).toHaveBeenCalledOnce();
   });
 });
 
