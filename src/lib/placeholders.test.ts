@@ -7,6 +7,13 @@ describe("placeholder utilities", () => {
       .toEqual(["§a", "%1$s", "%d", "\\n", "{0}"]);
   });
 
+  it("does not treat ordinary percentages as printf placeholders", () => {
+    expect(extractPlaceholders("100% complete / 50% charged / 25% to drop"))
+      .toEqual([]);
+    expect(extractPlaceholders("%s / %1$s / %%"))
+      .toEqual(["%s", "%1$s", "%%"]);
+  });
+
   it("allows reordered placeholders but rejects missing ones", () => {
     expect(validatePlaceholders("%s: %d", "%d：%s")).toBe(true);
     expect(validatePlaceholders("%s: %d", "%s")).toBe(false);

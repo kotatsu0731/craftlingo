@@ -1,5 +1,5 @@
 import { Engine, type Message, type Tool } from "@litert-lm/core";
-import { validatePlaceholders } from "./placeholders";
+import { extractPlaceholders, validatePlaceholders } from "./placeholders";
 
 export type GemmaModel = "e2b" | "e4b";
 
@@ -264,6 +264,72 @@ interface TranslationResponse {
   translations: Array<{ id?: number; text?: string }>;
 }
 
+interface ProtectedSource {
+  source: string;
+  restore: (translation: string) => string | undefined;
+}
+
+const CRAFTLINGO_MARKER_PREFIX = "__CRAFTLINGO_FORMAT_";
+const CRAFTLINGO_MARKER_PATTERN = /__CRAFTLINGO_FORMAT_[A-Za-z0-9_-]+__/;
+
+function hasOwnTranslation(translations: Record<string, string>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(translations, key);
+}
+
+function setTranslation(
+  translations: Record<string, string>,
+  key: string,
+  value: string,
+): void {
+  // Define a data property instead of assigning directly so a localization key
+  // such as "__proto__" cannot mutate the result object's prototype.
+  Object.defineProperty(translations, key, {
+    configurable: true,
+    enumerable: true,
+    value,
+    writable: true,
+  });
+}
+
+function protectSourceTokens(source: string, entryId: number): ProtectedSource {
+  const tokens = extractPlaceholders(source);
+  if (tokens.length === 0) {
+    return {
+      source,
+      restore: (translation) => CRAFTLINGO_MARKER_PATTERN.test(translation) ? undefined : translation,
+    };
+  }
+
+  // Include the entry ID so a marker copied from a different item cannot be
+  // restored as this item's formatting token.
+  let markerPrefix = `${CRAFTLINGO_MARKER_PREFIX}${entryId}_`;
+  while (source.includes(markerPrefix)) markerPrefix = `_${markerPrefix}`;
+
+  const markers = tokens.map((_token, index) => `${markerPrefix}${index}__`);
+  let protectedSource = "";
+  let cursor = 0;
+  for (const [index, token] of tokens.entries()) {
+    const tokenStart = source.indexOf(token, cursor);
+    protectedSource += source.slice(cursor, tokenStart) + markers[index];
+    cursor = tokenStart + token.length;
+  }
+  protectedSource += source.slice(cursor);
+
+  return {
+    source: protectedSource,
+    restore: (translation) => {
+      const restored = markers.reduce(
+        (current, marker, index) => current.replaceAll(marker, tokens[index]),
+        translation,
+      );
+      // Missing markers are rejected by validatePlaceholders below. Any
+      // marker left after this entry's markers are restored is either leaked
+      // from another entry or unresolved, so reject this entry as a whole.
+      return CRAFTLINGO_MARKER_PATTERN.test(restored) ? undefined : restored;
+    },
+  };
+}
+
 const SUBMIT_TRANSLATIONS_TOOL: Tool = {
   type: "function",
   function: {
@@ -477,77 +543,128 @@ export class GemmaTranslator {
     signal?: AbortSignal,
   ): Promise<TranslationResult> {
     return this.captureDiagnostics(async () => {
-      if (!this.engine) throw new Error("Gemmaモデルが読み込まれていません。");
+      const engine = this.engine;
+      if (!engine) throw new Error("Gemmaモデルが読み込まれていません。");
       if (entries.length === 0) return { translations: {}, rejected: [] };
 
       throwIfAborted(signal);
+      const firstAttempt = await this.translateOnce(engine, entries, glossary, signal);
+      if (firstAttempt.rejected.length === 0) return firstAttempt;
 
-      const conversation = await this.engine.createConversation({
-        enableConstrainedDecoding: true,
-        preface: {
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are a professional Japanese localizer for Minecraft mods. Submit the result by calling submit_translations exactly once. Preserve every printf token, {0} token, formatting code, and escaped newline exactly. Keep item names concise and tooltips natural.",
-            },
-          ],
-          tools: [SUBMIT_TRANSLATIONS_TOOL],
-        },
+      this.diagnosticListener?.({
+        level: "warning",
+        message: `LiteRT-LMの一括応答で${firstAttempt.rejected.length}件が欠落または形式不一致になったため、1件ずつ再試行します。`,
       });
 
-      const cancelConversation = () => conversation.cancel();
-      signal?.addEventListener("abort", cancelConversation, { once: true });
-
-      try {
+      const translations = { ...firstAttempt.translations };
+      const entriesByKey = new Map(entries.map((entry) => [entry.key, entry]));
+      for (const key of firstAttempt.rejected) {
         throwIfAborted(signal);
-        const payload = entries.map((entry, id) => ({ id, key: entry.key, source: entry.source }));
-        const response = await conversation.sendMessage(
-          `Translate every English source into natural Japanese. Apply the glossary when relevant. Do not translate keys. Call submit_translations exactly once with one translation for every input ID.\n\nGlossary:\n${JSON.stringify(glossary)}\n\nInput:\n${JSON.stringify({ entries: payload })}`,
+        const entry = entriesByKey.get(key);
+        if (!entry) continue;
+        const retry = await this.translateOnce(engine, [entry], glossary, signal);
+        for (const [retryKey, retryText] of Object.entries(retry.translations)) {
+          setTranslation(translations, retryKey, retryText);
+        }
+      }
+
+      return {
+        translations,
+        rejected: entries
+          .filter((entry) => !hasOwnTranslation(translations, entry.key))
+          .map((entry) => entry.key),
+      };
+    });
+  }
+
+  private async translateOnce(
+    engine: Engine,
+    entries: TranslationInput[],
+    glossary: Record<string, string>,
+    signal?: AbortSignal,
+  ): Promise<TranslationResult> {
+    const protectedSources = entries.map((entry, id) => protectSourceTokens(entry.source, id));
+    const conversation = await engine.createConversation({
+      enableConstrainedDecoding: true,
+      preface: {
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a professional Japanese localizer for Minecraft mods. Submit the result by calling submit_translations exactly once. Copy every __CRAFTLINGO_FORMAT_<entry>_<n>__ marker exactly and never alter, omit, or move it to another entry. Keep item names concise and tooltips natural.",
+          },
+        ],
+        tools: [SUBMIT_TRANSLATIONS_TOOL],
+      },
+    });
+
+    const cancelConversation = () => conversation.cancel();
+    signal?.addEventListener("abort", cancelConversation, { once: true });
+
+    try {
+      throwIfAborted(signal);
+      const payload = protectedSources.map(({ source }, id) => ({ id, source }));
+      const response = await conversation.sendMessage(
+        `Translate every English source into natural Japanese. Apply the glossary when relevant. Copy protected formatting markers exactly. Call submit_translations exactly once with one translation for every numeric input ID.\n\nGlossary:\n${JSON.stringify(glossary)}\n\nInput:\n${JSON.stringify({ entries: payload })}`,
+      );
+      throwIfAborted(signal);
+      const rawResponse = textFromResponse(response.content);
+      let parsed: TranslationResponse;
+      try {
+        parsed = parseTranslationMessage(response);
+      } catch (error) {
+        console.warn("Gemmaの応答JSONを解析できませんでした。再試行します。", error, rawResponse);
+        throwIfAborted(signal);
+        const retry = await conversation.sendMessage(
+          "Call submit_translations now exactly once. Its translations argument must contain the complete translation for every input ID. Do not reply with normal text.",
         );
         throwIfAborted(signal);
-        const rawResponse = textFromResponse(response.content);
-        let parsed: TranslationResponse;
+        const rawRetryResponse = textFromResponse(retry.content);
         try {
-          parsed = parseTranslationMessage(response);
-        } catch (error) {
-          console.warn("Gemmaの応答JSONを解析できませんでした。再試行します。", error, rawResponse);
-          throwIfAborted(signal);
-          const retry = await conversation.sendMessage(
-            "Call submit_translations now exactly once. Its translations argument must contain the complete translation for every input ID. Do not reply with normal text.",
-          );
-          throwIfAborted(signal);
-          const rawRetryResponse = textFromResponse(retry.content);
-          try {
-            parsed = parseTranslationMessage(retry);
-          } catch (retryError) {
-            console.error("再試行したGemmaの応答JSONも解析できませんでした。", retryError, rawRetryResponse);
-            return { translations: {}, rejected: entries.map((entry) => entry.key) };
-          }
+          parsed = parseTranslationMessage(retry);
+        } catch (retryError) {
+          console.error("再試行したGemmaの応答JSONも解析できませんでした。", retryError, rawRetryResponse);
+          return { translations: {}, rejected: entries.map((entry) => entry.key) };
         }
-        const translations: Record<string, string> = {};
-        const rejected: string[] = [];
-
-        for (const entry of parsed.translations ?? []) {
-          if (typeof entry.id !== "number" || typeof entry.text !== "string") continue;
-          const sourceEntry = entries[entry.id];
-          if (!sourceEntry) continue;
-          if (!validatePlaceholders(sourceEntry.source, entry.text)) {
-            rejected.push(sourceEntry.key);
-            continue;
-          }
-          translations[sourceEntry.key] = entry.text;
-        }
-
-        for (const entry of entries) {
-          if (!(entry.key in translations) && !rejected.includes(entry.key)) rejected.push(entry.key);
-        }
-        return { translations, rejected };
-      } finally {
-        signal?.removeEventListener("abort", cancelConversation);
-        await conversation.delete();
       }
-    });
+      const translations: Record<string, string> = {};
+
+      for (const entry of parsed.translations ?? []) {
+        if (
+          typeof entry.id !== "number"
+          || !Number.isInteger(entry.id)
+          || typeof entry.text !== "string"
+        ) continue;
+        const sourceEntry = entries[entry.id];
+        if (!sourceEntry) continue;
+        const restored = protectedSources[entry.id].restore(entry.text);
+        if (!restored?.trim() || !validatePlaceholders(sourceEntry.source, restored)) continue;
+        setTranslation(translations, sourceEntry.key, restored);
+      }
+
+      return {
+        translations,
+        rejected: entries
+          .filter((entry) => !hasOwnTranslation(translations, entry.key))
+          .map((entry) => entry.key),
+      };
+    } catch (error) {
+      // LiteRT-LM rejects the in-flight generation with its own error after
+      // cancel() is called. Preserve the caller's abort reason instead of
+      // leaking that runtime-specific error through the translation API.
+      if (signal?.aborted) throwIfAborted(signal);
+      throw error;
+    } finally {
+      signal?.removeEventListener("abort", cancelConversation);
+      try {
+        await conversation.delete();
+      } catch (error) {
+        // Cleanup must not replace the caller's abort reason if the runtime
+        // reports a secondary deletion failure while cancellation is active.
+        if (signal?.aborted) throwIfAborted(signal);
+        throw error;
+      }
+    }
   }
 
   async dispose(): Promise<void> {
