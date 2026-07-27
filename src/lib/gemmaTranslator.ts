@@ -266,8 +266,11 @@ interface TranslationResponse {
 
 interface ProtectedSource {
   source: string;
-  restore: (translation: string) => string;
+  restore: (translation: string) => string | undefined;
 }
+
+const CRAFTLINGO_MARKER_PREFIX = "__CRAFTLINGO_FORMAT_";
+const CRAFTLINGO_MARKER_PATTERN = /__CRAFTLINGO_FORMAT_[A-Za-z0-9_-]+__/;
 
 function hasOwnTranslation(translations: Record<string, string>, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(translations, key);
@@ -288,11 +291,18 @@ function setTranslation(
   });
 }
 
-function protectSourceTokens(source: string): ProtectedSource {
+function protectSourceTokens(source: string, entryId: number): ProtectedSource {
   const tokens = extractPlaceholders(source);
-  if (tokens.length === 0) return { source, restore: (translation) => translation };
+  if (tokens.length === 0) {
+    return {
+      source,
+      restore: (translation) => CRAFTLINGO_MARKER_PATTERN.test(translation) ? undefined : translation,
+    };
+  }
 
-  let markerPrefix = "__CRAFTLINGO_FORMAT_";
+  // Include the entry ID so a marker copied from a different item cannot be
+  // restored as this item's formatting token.
+  let markerPrefix = `${CRAFTLINGO_MARKER_PREFIX}${entryId}_`;
   while (source.includes(markerPrefix)) markerPrefix = `_${markerPrefix}`;
 
   const markers = tokens.map((_token, index) => `${markerPrefix}${index}__`);
@@ -307,10 +317,16 @@ function protectSourceTokens(source: string): ProtectedSource {
 
   return {
     source: protectedSource,
-    restore: (translation) => markers.reduce(
-      (restored, marker, index) => restored.replaceAll(marker, tokens[index]),
-      translation,
-    ),
+    restore: (translation) => {
+      const restored = markers.reduce(
+        (current, marker, index) => current.replaceAll(marker, tokens[index]),
+        translation,
+      );
+      // Missing markers are rejected by validatePlaceholders below. Any
+      // marker left after this entry's markers are restored is either leaked
+      // from another entry or unresolved, so reject this entry as a whole.
+      return CRAFTLINGO_MARKER_PATTERN.test(restored) ? undefined : restored;
+    },
   };
 }
 
@@ -567,7 +583,7 @@ export class GemmaTranslator {
     glossary: Record<string, string>,
     signal?: AbortSignal,
   ): Promise<TranslationResult> {
-    const protectedSources = entries.map((entry) => protectSourceTokens(entry.source));
+    const protectedSources = entries.map((entry, id) => protectSourceTokens(entry.source, id));
     const conversation = await engine.createConversation({
       enableConstrainedDecoding: true,
       preface: {
@@ -575,7 +591,7 @@ export class GemmaTranslator {
           {
             role: "system",
             content:
-              "You are a professional Japanese localizer for Minecraft mods. Submit the result by calling submit_translations exactly once. Copy every __CRAFTLINGO_FORMAT_n__ marker exactly and never alter, omit, or move it to another entry. Keep item names concise and tooltips natural.",
+              "You are a professional Japanese localizer for Minecraft mods. Submit the result by calling submit_translations exactly once. Copy every __CRAFTLINGO_FORMAT_<entry>_<n>__ marker exactly and never alter, omit, or move it to another entry. Keep item names concise and tooltips natural.",
           },
         ],
         tools: [SUBMIT_TRANSLATIONS_TOOL],
@@ -622,7 +638,7 @@ export class GemmaTranslator {
         const sourceEntry = entries[entry.id];
         if (!sourceEntry) continue;
         const restored = protectedSources[entry.id].restore(entry.text);
-        if (!restored.trim() || !validatePlaceholders(sourceEntry.source, restored)) continue;
+        if (!restored?.trim() || !validatePlaceholders(sourceEntry.source, restored)) continue;
         setTranslation(translations, sourceEntry.key, restored);
       }
 

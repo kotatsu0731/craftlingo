@@ -175,7 +175,7 @@ describe("GemmaTranslator.translate", () => {
       }],
       [{
         id: 0,
-        text: "__CRAFTLINGO_FORMAT_0__一部の設定は既定値に置き換えられます。__CRAFTLINGO_FORMAT_1__現在の設定は一部上書きされる場合があります。__CRAFTLINGO_FORMAT_2__",
+        text: "__CRAFTLINGO_FORMAT_0_0__一部の設定は既定値に置き換えられます。__CRAFTLINGO_FORMAT_0_1__現在の設定は一部上書きされる場合があります。__CRAFTLINGO_FORMAT_0_2__",
       }],
     ];
     const sentMessages: string[] = [];
@@ -236,13 +236,62 @@ describe("GemmaTranslator.translate", () => {
       expect(message).not.toContain("@tooltip");
     }
     expect(sentMessages[0]).not.toContain("§e");
-    expect(sentMessages[0]).toContain("__CRAFTLINGO_FORMAT_0__");
+    expect(sentMessages[0]).toContain("__CRAFTLINGO_FORMAT_2_0__");
     expect(diagnostics).toHaveBeenCalledWith(expect.objectContaining({
       level: "warning",
       message: expect.stringContaining("2件"),
     }));
     expect(deletedConversations).toHaveLength(3);
     for (const deleted of deletedConversations) expect(deleted).toHaveBeenCalledOnce();
+  });
+
+  it("rejects leaked or unresolved markers and retries each affected entry", async () => {
+    const pendingResponses = [
+      [
+        { id: 0, text: "Energy" },
+        { id: 1, text: "Fuel __CRAFTLINGO_FORMAT_0_0__" },
+      ],
+      [{ id: 0, text: "Energy __CRAFTLINGO_FORMAT_0_0__" }],
+      [{ id: 0, text: "Fuel" }],
+    ];
+    const sentMessages: string[] = [];
+    const engine = {
+      createConversation: vi.fn().mockImplementation(async () => ({
+        cancel: vi.fn(),
+        delete: vi.fn().mockResolvedValue(undefined),
+        sendMessage: vi.fn().mockImplementation(async (message: string) => {
+          sentMessages.push(message);
+          return {
+            role: "assistant",
+            tool_calls: [{
+              type: "function",
+              function: {
+                name: "submit_translations",
+                arguments: { translations: pendingResponses.shift() },
+              },
+            }],
+          };
+        }),
+      })),
+    };
+    const translator = new GemmaTranslator();
+    (translator as unknown as { engine: typeof engine }).engine = engine;
+
+    await expect(translator.translate([
+      { key: "item.energy", source: "Energy: %s" },
+      { key: "item.fuel", source: "Fuel" },
+    ])).resolves.toEqual({
+      translations: {
+        "item.energy": "Energy %s",
+        "item.fuel": "Fuel",
+      },
+      rejected: [],
+    });
+
+    expect(engine.createConversation).toHaveBeenCalledTimes(3);
+    expect(sentMessages[0].match(/__CRAFTLINGO_FORMAT_\d+_\d+__/g)).toEqual([
+      "__CRAFTLINGO_FORMAT_0_0__",
+    ]);
   });
 
   it("cancels an in-flight conversation and preserves the abort reason", async () => {
